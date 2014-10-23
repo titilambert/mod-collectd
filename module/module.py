@@ -109,8 +109,6 @@ number = struct.Struct("!Q")
 short = struct.Struct("!H")
 double = struct.Struct("<d")
 
-elements = {}
-
 
 def decode_values(pktype, plen, buf):
     """ Decode values from collectd requests """
@@ -441,6 +439,7 @@ class Collectd_arbiter(BaseModule):
         self.port = port
         self.multicast = multicast
         self.grouped_collectd_plugins = grouped_collectd_plugins
+        self.elements = {}
 
     # When you are in "external" mode, that is the main loop of your process
     def main(self):
@@ -448,6 +447,7 @@ class Collectd_arbiter(BaseModule):
         self.set_proctitle(self.name)
         self.set_exit_handler()
 
+        elements = self.elements
         try:
             cs = CollectdServer(self.host, self.port, self.multicast, self.grouped_collectd_plugins)
             while True:
