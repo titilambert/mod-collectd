@@ -381,7 +381,7 @@ class Element(object):
         self.host_name = host_name
         self.sdesc = sdesc
         self.perf_datas = {}
-        self.last_update = 0.0
+        self.last_update = time.time()
         self.interval = interval
         self.got_new_data = False
 
