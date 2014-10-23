@@ -44,7 +44,7 @@ properties = {
 
 DEFAULT_PORT = 25826
 DEFAULT_MULTICAST_IP = "239.192.74.66"
-BUFFER_SIZE = 4096
+BUFFER_SIZE = 65536
 
 
 def get_instance(plugin):
