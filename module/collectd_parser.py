@@ -168,19 +168,26 @@ def decode_network_packet(buf):
 
 #############################################################################s
 
+def cdtime_to_time(cdt):
+    # fairly copied from http://git.verplant.org/?p=collectd.git;a=blob;f=src/daemon/utils_time.h
+    sec = cdt >> 30
+    nsec = ((cdt & 0b111111111111111111111111111111) /  1.073741824) / 10**9
+    assert 0 <= nsec < 1
+    return sec + nsec
+
+
 class Data(object):
-    time = 0
+    time = None
+    interval = None
     host = None
     plugin = None
     plugininstance = None
     type = None
     typeinstance = None
 
-    timehr = 0
-    intervalhr = 0
-
     def __init__(self, **kw):
-        [setattr(self, k, v) for k, v in kw.iteritems()]
+        for k,v in kw.iteritems():
+            setattr(self, k, v)
 
     @property
     def datetime(self):
@@ -206,7 +213,7 @@ class Data(object):
         return buf.getvalue()
 
     def __str__(self):
-        return "[%i] %s" % (self.time, self.source)
+        return "[%s] %s" % (self.time, self.source)
 
 
 
@@ -264,9 +271,6 @@ class Reader(object):
 
     def __init__(self, host=None, port=DEFAULT_PORT, multicast=False):
 
-        assert issubclass(self.Values, Values)
-        assert issubclass(self.Notification, Notification)
-
         if host is None:
             multicast = True
             host = DEFAULT_IPv4_GROUP
@@ -306,6 +310,9 @@ class Reader(object):
                     socket.IPPROTO_IPV6 if self.ipv6 else socket.IPPROTO_IP,
                     socket.IP_MULTICAST_LOOP, 0)
 
+    def close(self):
+        self._sock.close()
+
 
     def receive(self):
         """Receives a single raw collect network packet.
@@ -334,16 +341,18 @@ class Reader(object):
     def interpret_opcodes(self, iterable):
         vl = self.Values()
         nt = self.Notification()
+        assert isinstance(vl, Values)
+        assert isinstance(nt, Notification)
 
         for kind, data in iterable:
             if kind == TYPE_TIME:
                 vl.time = nt.time = data
             elif kind == TYPE_TIMEHR:
-                vl.timehr = nt.timehr = data
+                vl.time = nt.time = cdtime_to_time(data)
             elif kind == TYPE_INTERVAL:
                 vl.interval = data
             elif kind == TYPE_INTERVALHR:
-                vl.intervalhr = data
+                vl.interval = cdtime_to_time(data)
             elif kind == TYPE_HOST:
                 vl.host = nt.host = data
             elif kind == TYPE_PLUGIN:
@@ -362,3 +371,12 @@ class Reader(object):
             elif kind == TYPE_VALUES:
                 vl[:] = data
                 yield deepcopy(vl)
+
+    def read(self, iterable=None):
+        """ Return a list of decoded packets
+        """
+        if iterable is None:
+            iterable = self.decode()
+        if isinstance(iterable, basestring):
+            iterable = self.decode(iterable)
+        return self.interpret_opcodes(iterable)
