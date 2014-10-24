@@ -29,6 +29,7 @@ Collectd Plugin for Receiver or arbiter
 """
 
 import os
+import re
 import time
 import traceback
 from itertools import izip
@@ -36,6 +37,13 @@ from itertools import izip
 from shinken.basemodule import BaseModule
 from shinken.external_command import ExternalCommand
 from shinken.log import logger
+
+from .collectd_parser import (
+    DS_TYPE_COUNTER, DS_TYPE_GAUGE, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE,
+    Data, Values, Notification,
+    Reader
+)
+
 
 properties = {
     'daemons': ['arbiter', 'receiver'],
@@ -79,299 +87,13 @@ def get_instance(plugin):
     instance = Collectd_arbiter(plugin, host, port, multicast, grouped_collectd_plugins)
     return instance
 
-import socket
-import struct
-import time
-from StringIO import StringIO
 
 
-# Collectd message types
-TYPE_HOST = 0x0000
-TYPE_TIME = 0x0001
-TYPE_TIME_HR = 0x0008
-TYPE_PLUGIN = 0x0002
-TYPE_PLUGIN_INSTANCE = 0x0003
-TYPE_TYPE = 0x0004
-TYPE_TYPE_INSTANCE = 0x0005
-TYPE_VALUES = 0x0006
-TYPE_INTERVAL = 0x0007
-TYPE_INTERVAL_HR = 0x0009
-TYPE_MESSAGE = 0x0100
-TYPE_SEVERITY = 0x0101
-
-# DS kinds
-DS_TYPE_COUNTER = 0
-DS_TYPE_GAUGE = 1
-DS_TYPE_DERIVE = 2
-DS_TYPE_ABSOLUTE = 3
-
-header = struct.Struct("!2H")
-number = struct.Struct("!Q")
-short = struct.Struct("!H")
-double = struct.Struct("<d")
-
-
-def decode_values(pktype, plen, buf):
-    """ Decode values from collectd requests """
-    nvalues = short.unpack_from(buf, header.size)[0]
-    off = header.size + short.size + nvalues
-    valskip = double.size
-
-    # check the packet head
-    if ((valskip + 1) * nvalues + short.size + header.size) != plen:
-        return []
-    if double.size != number.size:
-        return []
-
-    result = []
-    for dstype in map(ord, buf[header.size + short.size:off]):
-        if (dstype == DS_TYPE_COUNTER or dstype == DS_TYPE_DERIVE or dstype == DS_TYPE_ABSOLUTE):
-            v = (dstype, number.unpack_from(buf, off)[0])
-            result.append(v)
-            off += valskip
-        elif dstype == DS_TYPE_GAUGE:
-            v = (dstype, double.unpack_from(buf, off)[0])
-            result.append(v)
-            off += valskip
-        else:
-            logger.warning("[Collectd] DS type %i unsupported" % dstype)
-
-    return result
-
-
-# Get a u64
-def decode_number(pktype, pklen, buf):
-    """ Decode number typed value """
-    return number.unpack_from(buf, header.size)[0]
-
-
-# Get a simple char
-def decode_string(msgtype, pklen, buf):
-    """ Decode string typed value """
-    return buf[header.size:pklen-1]
-
-# Mapping of message types to decoding functions.
-decoder_mapping = {
-    TYPE_VALUES: decode_values,
-    TYPE_TIME: decode_number,
-    TYPE_TIME_HR: decode_number,
-    TYPE_INTERVAL: decode_number,
-    TYPE_INTERVAL_HR: decode_number,
-    TYPE_HOST: decode_string,
-    TYPE_PLUGIN: decode_string,
-    TYPE_PLUGIN_INSTANCE: decode_string,
-    TYPE_TYPE: decode_string,
-    TYPE_TYPE_INSTANCE: decode_string,
-    TYPE_MESSAGE: decode_string,
-    TYPE_SEVERITY: decode_number,
+_severity_2_retcode = {
+    Notification.OKAY:      0,
+    Notification.FAILURE:   2,
+    Notification.WARNING:   3,
 }
-
-
-def decode_packet(buf):
-    """ decode packet from collectd requests """
-    off = 0
-    buflen = len(buf)
-    while off < buflen:
-        pktype, pklen = header.unpack_from(buf, off)
-
-        if pklen > buflen - off:
-            raise ValueError("Packet too long?")
-
-        if pktype not in decoder_mapping:
-            raise ValueError("Message type %i not recognized" % pktype)
-
-        v = decoder_mapping[pktype](pktype, pklen, buf[off:])
-        yield pktype, v
-        off += pklen
-
-
-class Data(list, object):
-    """ This class will transform datas
-
-    :grouped_collectd_plugins: list of collecd plugins to group
-    """
-    def __init__(self, grouped_collectd_plugins=[],  **kw):
-
-        self.kind = 0
-        self.time = 0
-        self.interval = 0
-        self.host = None
-        self.plugin = ''
-        self.plugininstance = ''
-        self.type = ''
-        self.typeinstance = ''
-        self.message = ''
-        self.severity = 0
-        self.values = []
-        self.grouped_collectd_plugins = grouped_collectd_plugins
-
-    def __str__(self):
-        """ Return a readable format of a Data object """
-        return "[%i] %s" % (self.time, self.values)
-
-    def get_srv_desc(self):
-        """ Determine service name from collectd datas """
-        r = self.plugin
-        if not r in self.grouped_collectd_plugins:
-            if self.plugininstance:
-                r += '-' + self.plugininstance
-        return r
-
-    def get_message(self):
-        """ Get message of a Data object
-        """
-        return self.message
-
-    def get_kind(self):
-        """ Get kind of a Data object
-        """
-        return self.kind
-
-    def get_metric_name(self):
-        """ Determine perf data name from collectd datas
-        """
-        r = self.type
-        if self.plugin in self.grouped_collectd_plugins:
-            if self.plugininstance:
-                r += '-' + self.plugininstance
-        if self.typeinstance:
-            r += '-' + self.typeinstance
-        return r
-
-    def get_metric_values(self):
-        """ Determine perf datas from collectd datas
-        """
-        if len(self.values) == 0:
-            return None
-        return self.values
-
-    def get_name(self):
-        """ Determine data name from collectd datas
-        """
-        if not self.host:
-            return None
-        srv_desc = self.get_srv_desc()
-        r = '%s;%s' % (self.host, srv_desc)
-        return r
-
-    def get_time(self):
-        """ Return data time from collectd datas
-        """
-        return self.time
-
-    def get_message_command(self):
-        """ Return data severity (exit code) from collectd datas
-        """
-        now = int(time.time())
-        if self.severity == 4:  # OK
-            returncode = 0
-        elif self.severity == 1:
-            returncode = 2
-        elif self.severity == 2:
-            returncode = 1
-        else:
-            returncode = 3
-        return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (now,
-                                                                  self.host,
-                                                                  self.get_srv_desc(),
-                                                                  returncode,
-                                                                  self.message,
-                                                                  )
-
-
-class CollectdServer(object):
-    """ Collectd server
-    This class listen and and handle collectd requests
-
-    :host:                     Bind address
-    :port:                     Bind port
-    :multicast:                Enable multisite
-    :grouped_collectd_plugins: List of collecd plugins to group
-    """
-    def __init__(self, host, port, multicast, grouped_collectd_plugins=[]):
-        self.host = host
-        self.port = port
-        self.grouped_collectd_plugins = grouped_collectd_plugins
-
-        logger.info("[Collectd] Opening socket")
-        family, socktype, proto, _, sockaddr = socket.getaddrinfo(None if multicast else self.host,
-                                                                  self.port,
-                                                                  socket.AF_UNSPEC,
-                                                                  socket.SOCK_DGRAM,
-                                                                  0,
-                                                                  socket.AI_PASSIVE,
-                                                                  )[0]
-
-        self._sock = socket.socket(family, socktype, proto)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(sockaddr)
-        logger.info("[Collectd] Socket open")
-
-        if multicast:
-            if hasattr(socket, "SO_REUSEPORT"):
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
-            val = struct.pack("4sl", socket.inet_aton(self.host), socket.INADDR_ANY)
-
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, val)
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-
-        logger.info("[Collectd] Socket is opened")
-
-    def interpret_opcodes(self, iterable):
-        """ Decode some stuff from Collectd
-        """
-        d = Data(self.grouped_collectd_plugins)
-
-        for kind, data in iterable:
-            d.kind = kind
-            if kind == TYPE_TIME:
-                d.time = data
-            elif kind == TYPE_TIME_HR:
-                d.time = data >> 30
-            elif kind == TYPE_INTERVAL:
-                d.interval = data
-            elif kind == TYPE_INTERVAL_HR:
-                d.interval = data >> 30
-            elif kind == TYPE_HOST:
-                d.host = data
-            elif kind == TYPE_PLUGIN:
-                d.plugin = data
-            elif kind == TYPE_PLUGIN_INSTANCE:
-                d.plugininstance = data
-            elif kind == TYPE_TYPE:
-                d.type = data
-            elif kind == TYPE_TYPE_INSTANCE:
-                d.typeinstance = data
-            elif kind == TYPE_SEVERITY:
-                d.severity = data
-            elif kind == TYPE_VALUES:
-                d.values = data
-                yield d
-            elif kind == TYPE_MESSAGE:
-                d.message = data
-                yield d
-
-    def receive(self):
-        """ Read socket
-        """
-        return self._sock.recv(BUFFER_SIZE)
-
-    def decode(self, buf=None):
-        """ Return a decode packet
-        """
-        if buf is None:
-            buf = self.receive()
-        return decode_packet(buf)
-
-    def read(self, iterable=None):
-        """ Return a list of decoded packets
-        """
-        if iterable is None:
-            iterable = self.decode()
-        if isinstance(iterable, basestring):
-            iterable = self.decode(iterable)
-        return self.interpret_opcodes(iterable)
 
 
 class Element(object):
@@ -432,6 +154,7 @@ class Element(object):
             return r
 
 
+
 class Collectd_arbiter(BaseModule):
     """ Main class for this collecitd module """
     def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=[]):
@@ -442,6 +165,48 @@ class Collectd_arbiter(BaseModule):
         self.grouped_collectd_plugins = grouped_collectd_plugins
         self.elements = {}
 
+    #########################################################################
+    # helpers:
+
+    def get_srv_desc(self, item):
+        '''
+        :param item: A collectd Values instance.
+        :return: The Shinken service name related by this collectd stats item.
+        '''
+        assert isinstance(item, Data)
+        res = item.plugin
+        if item.plugin not in self.grouped_collectd_plugins:
+            if item.plugininstance:
+                res += '-' + item.plugininstance
+        # Dirty fix for 1.4.X:
+        return re.sub(r'[' + "`~!$%^&*\"|'<>?,()=" + ']+', '_', res)
+
+    def get_metric_name(self, item):
+        assert isinstance(item, Values)
+        res = item.type
+        if item.plugin in self.grouped_collectd_plugins:
+            if item.plugininstance:
+                res += '-' + item.plugininstance
+        if item.typeinstance:
+            res += '-' + item.typeinstance
+        return res
+
+    def get_name(self, item):
+        return '%s;%s' % (item.host, self.get_srv_desc(item))
+
+    def get_time(self, item):
+        return item.time if item.time else item.timehr
+
+    #-------------------------------------
+
+    def get_notification_message_command(self, notif):
+        assert isinstance(notif, Notification)
+        now = int(time.time())
+        retcode = _severity_2_retcode.get(notif.severity, 3)
+        return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (
+                now, notif.host, self.get_srv_desc(notif), retcode, notif.message)
+
+    #########################################################################
 
     # When you are in "external" mode, that is the main loop of your process
     def main(self):
@@ -451,30 +216,36 @@ class Collectd_arbiter(BaseModule):
 
         elements = self.elements
         try:
-            cs = CollectdServer(self.host, self.port, self.multicast, self.grouped_collectd_plugins)
+            collectdreader = Reader(self.host, self.port, self.multicast)
             while True:
                 # Each second we are looking at sending old elements
-                for e in elements.values():
-                    c = e.get_command()
-                    if c is not None:
-                        logger.debug("[Collectd] Got %s" % c)
-                        self.from_q.put(ExternalCommand(c))
-                for item in cs.read():
-                    logger.debug("[Collectd] %s: %s" % (item, item.__dict__))
-                    n = item.get_name()
-                    if n and n not in elements:
-                        e = Element(item.host,
-                                    item.get_srv_desc(),
-                                    item.interval)
-                        elements[n] = e
-                    e = elements[n]
-                    if item.get_kind() == TYPE_VALUES:
-                        e.add_perf_data(item.get_metric_name(),
-                                        item.get_metric_values(),
-                                        item.get_time())
-                    elif item.get_kind() == TYPE_MESSAGE:
-                        c = item.get_message_command()
-                        if c is not None:
-                            self.from_q.put(ExternalCommand(c))
+                for elem in elements.values():
+                    assert isinstance(elem, Element)
+                    cmd = elem.get_command()
+                    if cmd is not None:
+                        logger.debug("[Collectd] Got %s" % cmd)
+                        self.from_q.put(ExternalCommand(cmd))
+
+                for item in collectdreader.read():
+                    assert isinstance(item, Data)
+                    logger.debug("[Collectd] %s" % (item))
+
+                    if isinstance(item, Notification):
+                        cmd = self.get_notification_message_command(item)
+                        if cmd is not None:
+                            self.from_q.put(ExternalCommand(cmd))
+
+                    elif isinstance(item, Values):
+                        name = self.get_name(item)
+                        elem = elements.get(name, None)
+                        if elem is None:
+                            elem = Element(item.host,
+                                           self.get_srv_desc(item),
+                                           item.interval)
+                            elements[name] = elem
+                        elem.add_perf_data(self.get_metric_name(item),
+                                           item,
+                                           self.get_time(item))
+
         except Exception as err:
             logger.error("[Collectd] Unexpected error: %s ; %s", err, traceback.format_exc())
