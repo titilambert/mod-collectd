@@ -7,12 +7,14 @@ from shinken.log import logger
 
 
 from .collectd_parser import (
-    Reader, Values, Data, Notification
+    CollectdException,
+    Reader,
+    Values as _Values, Data as _Data, Notification as _Notification
 )
 
 
 
-class Data(Data):
+class Data(_Data):
 
     def get_srv_desc(self):
         '''
@@ -38,17 +40,14 @@ class Data(Data):
     def get_name(self):
         return '%s;%s' % (self.host, self.get_srv_desc())
 
-    def get_time(self):
-        return self.time if self.time else self.timehr
 
 
-
-class Notification(Notification):
+class Notification(_Notification):
 
     _severity_2_retcode = {
-        Notification.OKAY:      0,
-        Notification.FAILURE:   2,
-        Notification.WARNING:   3,
+        _Notification.OKAY:      0,
+        _Notification.WARNING:   1,
+        _Notification.FAILURE:   2,
     }
 
     def get_message_command(self):
@@ -60,17 +59,17 @@ class Notification(Notification):
             now, self.host, self.get_srv_desc(), retcode, self.message)
 
 
-class Values(Data, Values):
+class Values(Data, _Values):
     pass
 
 
 
-class Shinken_Collectd_Reader(Reader):
+class ShinkenCollectdReader(Reader):
+
 
     def __init__(self, *a, **kw):
-        self.grouped_collectd_plugins = kw.get('grouped_collectd_plugins', [])
-        super(Shinken_Collectd_Reader, self).__init__(*a, **kw)
-
+        self.grouped_collectd_plugins = kw.pop('grouped_collectd_plugins', [])
+        super(ShinkenCollectdReader, self).__init__(*a, **kw)
 
     def Values(self):
         return Values(grouped_collectd_plugins=self.grouped_collectd_plugins)
@@ -82,6 +81,7 @@ class Shinken_Collectd_Reader(Reader):
     def receive(self):
         """Receives a single raw collect network packet.
         """
-        buf = super(Shinken_Collectd_Reader, self).receive()
-        logger.info('Got packet %s bytes', len(buf))
+        buf = super(ShinkenCollectdReader, self).receive()
+        logger.info('Got packet %s bytes' % len(buf))
         return buf
+

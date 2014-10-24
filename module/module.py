@@ -39,11 +39,12 @@ from shinken.external_command import ExternalCommand
 from shinken.log import logger
 
 from .collectd_parser import (
+    CollectdException,
     DS_TYPE_COUNTER, DS_TYPE_GAUGE, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE
 )
 from .collectd_shinken_parser import (
     Data, Values, Notification,
-    Shinken_Collectd_Reader
+    ShinkenCollectdReader
 )
 
 
@@ -100,6 +101,7 @@ _severity_2_retcode = {
 
 class Element(object):
     """ Element store service name and all perfdatas before send it in a external command """
+
     def __init__(self, host_name, sdesc, interval):
         self.host_name = host_name
         self.sdesc = sdesc
