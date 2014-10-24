@@ -99,6 +99,8 @@ _severity_2_retcode = {
 }
 
 
+_ELEMENT_MAX_AGE_SEC = 3600
+
 class Element(object):
     """ Element store service name and all perfdatas before send it in a external command """
 
@@ -107,7 +109,8 @@ class Element(object):
         self.sdesc = sdesc
         self.perf_datas = {}
         self.last_update = time.time()
-        self.interval = interval
+        self.cur_interval = 2*interval # for the first time we'll wait 2*interval to be sure to get a complete data set.
+        self.interval = interval # one the first command is done we'll reset interval to this.
         self.got_new_data = False
 
     def add_perf_data(self, mname, mvalues, mtime):
@@ -143,19 +146,20 @@ class Element(object):
             return None
 
         now = int(time.time())
-        if now > self.last_update + self.interval:
-            r = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
+        if now > self.last_update + self.cur_interval:
+            res = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
             for (k, v) in self.perf_datas.iteritems():
                 for i, w in enumerate(v):
                     if len(v) > 1:
-                        r += '%s_%d=%s ' % (k, i, str(w[2]))
+                        res += '%s_%d=%s ' % (k, i, str(w[2]))
                     else:
-                        r += '%s=%s ' % (k, str(w[2]))
+                        res += '%s=%s ' % (k, str(w[2]))
             logger.debug('Updating: %s - %s ' % (self.host_name, self.sdesc))
 #            self.perf_datas.clear()
             self.last_update = now
             self.got_new_data = False
-            return r
+            self.cur_interval = self.interval
+            return res
 
 
 
@@ -225,12 +229,16 @@ class Collectd_arbiter(BaseModule):
                                     grouped_collectd_plugins=self.grouped_collectd_plugins)
             while True:
                 # Each second we are looking at sending old elements
-                for elem in elements.values():
+                for name, elem in elements.items():
                     assert isinstance(elem, Element)
                     cmd = elem.get_command()
                     if cmd is not None:
                         logger.debug("[Collectd] Got %s" % cmd)
                         self.from_q.put(ExternalCommand(cmd))
+                    else:
+                        if elem.last_update < now - _ELEMENT_MAX_AGE_SEC:
+                            # purging old elements:
+                            del elements[name]
 
                 for item in collectdreader.read():
                     assert isinstance(item, Data)
