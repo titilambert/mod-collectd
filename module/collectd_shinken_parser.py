@@ -85,3 +85,10 @@ class ShinkenCollectdReader(Reader):
         logger.info('Got packet %s bytes' % len(buf))
         return buf
 
+
+    def read(self, iterable=None):
+        try:
+            return tuple(super(ShinkenCollectdReader, self).read(iterable))
+        except CollectdException as err:
+            logger.warn('Got Collectd protocol error: %s' % err)
+        return ()
