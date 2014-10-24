@@ -8,6 +8,9 @@
 
 #
 # Updated by Rami Sayar for Collectd 5.1. Added DERIVE handling.
+# Updated by Grégory Starck with few enhancements.
+#  - notably possibility to subclass Values and Notification.
+
 """
 Collectd network protocol implementation.
 """
@@ -40,7 +43,7 @@ DEFAULT_IPv6_GROUP = "ff18::efc0:4a42"
 # https://collectd.org/wiki/index.php/Binary_protocol
 # -> Protocol structure
 # " The maximum length of payload in any part is therefore 65531 bytes. "
-_BUFFER_SIZE = 65535 # with
+_BUFFER_SIZE = 65535 # 65535 > 65531, ok we are safe.
 
 #############################################################################s
 
