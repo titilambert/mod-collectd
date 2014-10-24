@@ -165,11 +165,14 @@ class Element(object):
 
 class Collectd_arbiter(BaseModule):
     """ Main class for this collecitd module """
-    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=[]):
+
+    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=None):
         BaseModule.__init__(self, modconf)
         self.host = host
         self.port = port
         self.multicast = multicast
+        if grouped_collectd_plugins is None:
+            grouped_collectd_plugins = []
         self.grouped_collectd_plugins = grouped_collectd_plugins
         self.elements = {}
 
