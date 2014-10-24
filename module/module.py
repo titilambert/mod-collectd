@@ -108,58 +108,59 @@ class Element(object):
         self.host_name = host_name
         self.sdesc = sdesc
         self.perf_datas = {}
-        self.last_update = time.time()
-        self.cur_interval = 2*interval # for the first time we'll wait 2*interval to be sure to get a complete data set.
-        self.interval = interval # one the first command is done we'll reset interval to this.
+        # for the first time we'll wait 2*interval to be sure to get a complete data set :
+        self.last_update = time.time() + interval
+        self.interval = interval
         self.got_new_data = False
 
     def add_perf_data(self, mname, mvalues, mtime):
-        """ Add perf datas to the message to send to Shinken """
+        """ Add perf datas to this element """
         if not mvalues:
             return
 
-        r = []
+        res = []
         if mname not in self.perf_datas:
             for (dstype, newrawval) in mvalues:
-                r.append((dstype, newrawval, newrawval, mtime))
+                res.append((dstype, newrawval, newrawval, mtime))
         else:
             oldvalues = self.perf_datas[mname]
-
             for (olddstype, oldrawval, oldval, oldtime), (dstype, newrawval) in izip(oldvalues, mvalues):
                 difftime = mtime - oldtime
                 if difftime < 1:
                     continue
-                if dstype == DS_TYPE_COUNTER or dstype == DS_TYPE_DERIVE or dstype == DS_TYPE_ABSOLUTE:
-                    r.append((dstype, newrawval, (newrawval - oldrawval) / float(difftime), mtime))
+                if dstype in (DS_TYPE_COUNTER, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE):
+                    res.append((dstype, newrawval, (newrawval - oldrawval) / float(difftime), mtime))
                 elif dstype == DS_TYPE_GAUGE:
-                    r.append((dstype, newrawval, newrawval, mtime))
+                    res.append((dstype, newrawval, newrawval, mtime))
 
-        self.perf_datas[mname] = r
-        self.got_new_data = True
+        self.perf_datas[mname] = res
+        self.got_new_data = bool(res)
+
 
     def get_command(self):
-        """ Prepare the external command for Shinken """
-        if len(self.perf_datas) == 0:
-            return None
-
+        """ Look if this element has data to be sent to Shinken.
+        :return
+            - None if element has no ready data.
+            - The command to be sent otherwise. """
         if not self.got_new_data:
-            return None
+            return
 
-        now = int(time.time())
-        if now > self.last_update + self.cur_interval:
-            res = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
-            for (k, v) in self.perf_datas.iteritems():
-                for i, w in enumerate(v):
-                    if len(v) > 1:
-                        res += '%s_%d=%s ' % (k, i, str(w[2]))
-                    else:
-                        res += '%s=%s ' % (k, str(w[2]))
-            logger.debug('Updating: %s - %s ' % (self.host_name, self.sdesc))
-#            self.perf_datas.clear()
-            self.last_update = now
-            self.got_new_data = False
-            self.cur_interval = self.interval
-            return res
+        now = time.time()
+        if now < self.last_update + self.interval:
+            return
+
+
+        res = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
+        for (k, v) in self.perf_datas.iteritems():
+            for i, w in enumerate(v):
+                if len(v) > 1:
+                    res += '%s_%d=%s ' % (k, i, str(w[2]))
+                else:
+                    res += '%s=%s ' % (k, str(w[2]))
+        #self.perf_datas.clear()  # should we or not ?
+        self.last_update = now
+        self.got_new_data = False
+        return res
 
 
 
@@ -185,25 +186,30 @@ class Collectd_arbiter(BaseModule):
         self.set_exit_handler()
 
         elements = self.elements
+        reader = ShinkenCollectdReader(self.host, self.port, self.multicast,
+                                       grouped_collectd_plugins=self.grouped_collectd_plugins)
+
         try:
-            collectdreader = Shinken_Collectd_Reader(self.host, self.port, self.multicast,
-                                    grouped_collectd_plugins=self.grouped_collectd_plugins)
-            while True:
+            while not self.interrupted:
+
+                now = time.time()
+
                 # Each second we are looking at sending old elements
                 for name, elem in elements.items():
                     assert isinstance(elem, Element)
                     cmd = elem.get_command()
-                    if cmd is not None:
-                        logger.debug("[Collectd] Got %s" % cmd)
+                    if cmd:
+                        logger.info("[Collectd] Got %s" % cmd)
                         self.from_q.put(ExternalCommand(cmd))
                     else:
                         if elem.last_update < now - _ELEMENT_MAX_AGE_SEC:
-                            # purging old elements:
                             del elements[name]
+                            logger.info('%s not anymore updated for %s secs ; purged.' % _ELEMENT_MAX_AGE_SEC)
 
-                for item in collectdreader.read():
+                for item in reader.read():
+
                     assert isinstance(item, Data)
-                    logger.debug("[Collectd] %s" % item)
+                    logger.debug("[Collectd] < %s", str(item))
 
                     if isinstance(item, Notification):
                         cmd = item.get_message_command()
@@ -219,9 +225,17 @@ class Collectd_arbiter(BaseModule):
                                            item.get_srv_desc(),
                                            item.interval)
                             elements[name] = elem
-                        elem.add_perf_data(item.get_metric_name(),
-                                           item,
-                                           item.get_time())
+                        else:
+                            assert isinstance(elem, Element)
+                            if elem.interval != item.interval:
+                                # make sure interval is updated when it's changed by collectd client:
+                                elem.interval = item.interval
+                                # also reset last_update time so that we'll wait that before resending its data:
+                                elem.last_update = time.time() + elem.interval
+                        # now we can add this perf data:
+                        elem.add_perf_data(item.get_metric_name(), item, item.time)
 
         except Exception as err:
-            logger.error("[Collectd] Unexpected error: %s ; %s", err, traceback.format_exc())
+            logger.error("[Collectd] Unexpected error: %s ; %s" % (err, traceback.format_exc()))
+        finally:
+            reader.close()
