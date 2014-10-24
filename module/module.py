@@ -39,9 +39,11 @@ from shinken.external_command import ExternalCommand
 from shinken.log import logger
 
 from .collectd_parser import (
-    DS_TYPE_COUNTER, DS_TYPE_GAUGE, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE,
+    DS_TYPE_COUNTER, DS_TYPE_GAUGE, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE
+)
+from .collectd_shinken_parser import (
     Data, Values, Notification,
-    Reader
+    Shinken_Collectd_Reader
 )
 
 
@@ -168,43 +170,44 @@ class Collectd_arbiter(BaseModule):
     #########################################################################
     # helpers:
 
-    def get_srv_desc(self, item):
-        '''
-        :param item: A collectd Values instance.
-        :return: The Shinken service name related by this collectd stats item.
-        '''
-        assert isinstance(item, Data)
-        res = item.plugin
-        if item.plugin not in self.grouped_collectd_plugins:
-            if item.plugininstance:
-                res += '-' + item.plugininstance
-        # Dirty fix for 1.4.X:
-        return re.sub(r'[' + "`~!$%^&*\"|'<>?,()=" + ']+', '_', res)
+    if False:
+        def get_srv_desc(self, item):
+            '''
+            :param item: A collectd Data instance.
+            :return: The Shinken service name related by this collectd stats item.
+            '''
+            assert isinstance(item, Data)
+            res = item.plugin
+            if item.plugin not in self.grouped_collectd_plugins:
+                if item.plugininstance:
+                    res += '-' + item.plugininstance
+            # Dirty fix for 1.4.X:
+            return re.sub(r'[' + "`~!$%^&*\"|'<>?,()=" + ']+', '_', res)
 
-    def get_metric_name(self, item):
-        assert isinstance(item, Values)
-        res = item.type
-        if item.plugin in self.grouped_collectd_plugins:
-            if item.plugininstance:
-                res += '-' + item.plugininstance
-        if item.typeinstance:
-            res += '-' + item.typeinstance
-        return res
+        def get_metric_name(self, item):
+            assert isinstance(item, Values)
+            res = item.type
+            if item.plugin in self.grouped_collectd_plugins:
+                if item.plugininstance:
+                    res += '-' + item.plugininstance
+            if item.typeinstance:
+                res += '-' + item.typeinstance
+            return res
 
-    def get_name(self, item):
-        return '%s;%s' % (item.host, self.get_srv_desc(item))
+        def get_name(self, item):
+            return '%s;%s' % (item.host, self.get_srv_desc(item))
 
-    def get_time(self, item):
-        return item.time if item.time else item.timehr
+        def get_time(self, item):
+            return item.time if item.time else item.timehr
 
-    #-------------------------------------
+        #-------------------------------------
 
-    def get_notification_message_command(self, notif):
-        assert isinstance(notif, Notification)
-        now = int(time.time())
-        retcode = _severity_2_retcode.get(notif.severity, 3)
-        return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (
-                now, notif.host, self.get_srv_desc(notif), retcode, notif.message)
+        def get_notification_message_command(self, notif):
+            assert isinstance(notif, Notification)
+            now = int(time.time())
+            retcode = _severity_2_retcode.get(notif.severity, 3)
+            return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (
+                    now, notif.host, self.get_srv_desc(notif), retcode, notif.message)
 
     #########################################################################
 
@@ -216,7 +219,8 @@ class Collectd_arbiter(BaseModule):
 
         elements = self.elements
         try:
-            collectdreader = Reader(self.host, self.port, self.multicast)
+            collectdreader = Shinken_Collectd_Reader(self.host, self.port, self.multicast,
+                                    grouped_collectd_plugins=self.grouped_collectd_plugins)
             while True:
                 # Each second we are looking at sending old elements
                 for elem in elements.values():
@@ -228,24 +232,25 @@ class Collectd_arbiter(BaseModule):
 
                 for item in collectdreader.read():
                     assert isinstance(item, Data)
-                    logger.debug("[Collectd] %s" % (item))
+                    logger.debug("[Collectd] %s" % item)
 
                     if isinstance(item, Notification):
-                        cmd = self.get_notification_message_command(item)
+                        cmd = item.get_message_command()
                         if cmd is not None:
+                            logger.info('-> %s', cmd)
                             self.from_q.put(ExternalCommand(cmd))
 
                     elif isinstance(item, Values):
-                        name = self.get_name(item)
+                        name = item.get_name()
                         elem = elements.get(name, None)
                         if elem is None:
                             elem = Element(item.host,
-                                           self.get_srv_desc(item),
+                                           item.get_srv_desc(),
                                            item.interval)
                             elements[name] = elem
-                        elem.add_perf_data(self.get_metric_name(item),
+                        elem.add_perf_data(item.get_metric_name(),
                                            item,
-                                           self.get_time(item))
+                                           item.get_time())
 
         except Exception as err:
             logger.error("[Collectd] Unexpected error: %s ; %s", err, traceback.format_exc())
