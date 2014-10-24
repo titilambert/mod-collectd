@@ -30,6 +30,7 @@ Collectd Plugin for Receiver or arbiter
 
 import os
 import time
+import traceback
 from itertools import izip
 
 from shinken.basemodule import BaseModule
@@ -441,6 +442,7 @@ class Collectd_arbiter(BaseModule):
         self.grouped_collectd_plugins = grouped_collectd_plugins
         self.elements = {}
 
+
     # When you are in "external" mode, that is the main loop of your process
     def main(self):
         """ Plugin main loop """
@@ -474,7 +476,5 @@ class Collectd_arbiter(BaseModule):
                         c = item.get_message_command()
                         if c is not None:
                             self.from_q.put(ExternalCommand(c))
-        except Exception, e:
-            logger.error("[Collectd] exception: %s" % str(e))
-        except ValueError, exp:
-            logger.error("[Collectd] Read error: %s" % exp)
+        except Exception as err:
+            logger.error("[Collectd] Unexpected error: %s ; %s", err, traceback.format_exc())
