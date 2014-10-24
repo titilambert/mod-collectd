@@ -34,9 +34,13 @@ import time
 import traceback
 from itertools import izip
 
+#############################################################################
+
 from shinken.basemodule import BaseModule
 from shinken.external_command import ExternalCommand
 from shinken.log import logger
+
+#############################################################################
 
 from .collectd_parser import (
     CollectdException,
@@ -47,6 +51,7 @@ from .collectd_shinken_parser import (
     ShinkenCollectdReader
 )
 
+#############################################################################
 
 properties = {
     'daemons': ['arbiter', 'receiver'],
@@ -58,6 +63,7 @@ DEFAULT_PORT = 25826
 DEFAULT_MULTICAST_IP = "239.192.74.66"
 BUFFER_SIZE = 65536
 
+#############################################################################
 
 def get_instance(plugin):
     """ This function is called by the module manager
@@ -90,14 +96,7 @@ def get_instance(plugin):
     instance = Collectd_arbiter(plugin, host, port, multicast, grouped_collectd_plugins)
     return instance
 
-
-
-_severity_2_retcode = {
-    Notification.OKAY:      0,
-    Notification.FAILURE:   2,
-    Notification.WARNING:   3,
-}
-
+#############################################################################
 
 _ELEMENT_MAX_AGE_SEC = 3600
 
@@ -149,20 +148,20 @@ class Element(object):
         if now < self.last_update + self.interval:
             return
 
-
-        res = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
+        pdata = ''
         for (k, v) in self.perf_datas.iteritems():
             for i, w in enumerate(v):
                 if len(v) > 1:
-                    res += '%s_%d=%s ' % (k, i, str(w[2]))
+                    pdata += '%s_%d=%s ' % (k, i, str(w[2]))
                 else:
-                    res += '%s=%s ' % (k, str(w[2]))
-        #self.perf_datas.clear()  # should we or not ?
+                    pdata += '%s=%s ' % (k, str(w[2]))
+
         self.last_update = now
         self.got_new_data = False
-        return res
+        # TODO: self.perf_datas.clear()  # should we or not ?
+        return '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD|%s' % (int(now), self.host_name, self.sdesc, pdata)
 
-
+#############################################################################
 
 class Collectd_arbiter(BaseModule):
     """ Main class for this collecitd module """
@@ -174,10 +173,8 @@ class Collectd_arbiter(BaseModule):
         self.multicast = multicast
         if grouped_collectd_plugins is None:
             grouped_collectd_plugins = []
-        self.grouped_collectd_plugins = grouped_collectd_plugins
         self.elements = {}
-
-    #########################################################################
+        self.grouped_collectd_plugins = grouped_collectd_plugins
 
     # When you are in "external" mode, that is the main loop of your process
     def main(self):
@@ -204,7 +201,7 @@ class Collectd_arbiter(BaseModule):
                     else:
                         if elem.last_update < now - _ELEMENT_MAX_AGE_SEC:
                             del elements[name]
-                            logger.info('%s not anymore updated for %s secs ; purged.' % _ELEMENT_MAX_AGE_SEC)
+                            logger.info('%s not anymore updated for %s secs ; purged.' % (name, _ELEMENT_MAX_AGE_SEC))
 
                 for item in reader.read():
 
@@ -228,10 +225,14 @@ class Collectd_arbiter(BaseModule):
                         else:
                             assert isinstance(elem, Element)
                             if elem.interval != item.interval:
+                                logger.info('%s : interval changed from %s to %s ; adapting..' % (
+                                    name, elem.interval, item.interval))
                                 # make sure interval is updated when it's changed by collectd client:
                                 elem.interval = item.interval
                                 # also reset last_update time so that we'll wait that before resending its data:
                                 elem.last_update = time.time() + elem.interval
+                                elem.perf_datas.clear()
+
                         # now we can add this perf data:
                         elem.add_perf_data(item.get_metric_name(), item, item.time)
 
