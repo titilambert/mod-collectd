@@ -177,48 +177,6 @@ class Collectd_arbiter(BaseModule):
         self.elements = {}
 
     #########################################################################
-    # helpers:
-
-    if False:
-        def get_srv_desc(self, item):
-            '''
-            :param item: A collectd Data instance.
-            :return: The Shinken service name related by this collectd stats item.
-            '''
-            assert isinstance(item, Data)
-            res = item.plugin
-            if item.plugin not in self.grouped_collectd_plugins:
-                if item.plugininstance:
-                    res += '-' + item.plugininstance
-            # Dirty fix for 1.4.X:
-            return re.sub(r'[' + "`~!$%^&*\"|'<>?,()=" + ']+', '_', res)
-
-        def get_metric_name(self, item):
-            assert isinstance(item, Values)
-            res = item.type
-            if item.plugin in self.grouped_collectd_plugins:
-                if item.plugininstance:
-                    res += '-' + item.plugininstance
-            if item.typeinstance:
-                res += '-' + item.typeinstance
-            return res
-
-        def get_name(self, item):
-            return '%s;%s' % (item.host, self.get_srv_desc(item))
-
-        def get_time(self, item):
-            return item.time if item.time else item.timehr
-
-        #-------------------------------------
-
-        def get_notification_message_command(self, notif):
-            assert isinstance(notif, Notification)
-            now = int(time.time())
-            retcode = _severity_2_retcode.get(notif.severity, 3)
-            return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (
-                    now, notif.host, self.get_srv_desc(notif), retcode, notif.message)
-
-    #########################################################################
 
     # When you are in "external" mode, that is the main loop of your process
     def main(self):
