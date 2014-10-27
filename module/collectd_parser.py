@@ -18,11 +18,6 @@ Collectd network protocol implementation.
 import socket
 import struct
 
-try:
-    from cStringIO import StringIO
-except ImportError:
-    from StringIO import StringIO
-
 from datetime import datetime
 from copy import deepcopy
 
@@ -53,6 +48,9 @@ class CollectdException(Exception):
 class CollectdValueError(CollectdException, ValueError):
     pass
 
+class CollectdDecodeError(CollectdValueError):
+    pass
+
 class CollectdUnsupportedDSType(CollectdValueError):
     pass
 
@@ -80,6 +78,11 @@ TYPE_INTERVALHR      = 0x0009
 TYPE_MESSAGE         = 0x0100
 TYPE_SEVERITY        = 0x0101
 
+#
+TYPE_SIGN_SHA256     = 0x0200
+TYPE_ENCR_AES256     = 0x0210
+
+
 # DS kinds
 DS_TYPE_COUNTER      = 0
 DS_TYPE_GAUGE        = 1
@@ -92,34 +95,38 @@ signed_number = struct.Struct("!q") # DERIVE are signed long longs
 short  = struct.Struct("!H")
 double = struct.Struct("<d")
 
+assert double.size == number.size == signed_number.size == 8
+
 #############################################################################s
+
+_single_value_size = 1 + 8 # 1 byte for type, 8 bytes for value
+
+_part_value_decoder = {
+    DS_TYPE_COUNTER:    number,
+    DS_TYPE_ABSOLUTE:   number,
+    DS_TYPE_DERIVE:     signed_number,
+    DS_TYPE_GAUGE:      double
+}
 
 def decode_network_values(ptype, plen, buf):
     """Decodes a list of DS values in collectd network format
     """
+
     nvalues = short.unpack_from(buf, header.size)[0]
+    values_tot_size = header.size + short.size + nvalues * _single_value_size
+    if values_tot_size != plen:
+        raise CollectdValueError('Values total size != Part len (%s vs %s)' % (values_tot_size, plen))
+
     off = header.size + short.size + nvalues
-    valskip = double.size
-
-    # Check whether our expected packet size is the reported one
-    assert ((valskip + 1) * nvalues + short.size + header.size) == plen
-    assert double.size == number.size
-
-    result = []
+    results = []
     for dstype in map(ord, buf[header.size+short.size:off]):
-        if dstype == DS_TYPE_COUNTER:
-            result.append((dstype, number.unpack_from(buf, off)[0]))
-            off += valskip
-        elif dstype == DS_TYPE_GAUGE:
-            result.append((dstype, double.unpack_from(buf, off)[0]))
-            off += valskip
-        elif dstype == DS_TYPE_DERIVE:
-            result.append((dstype, signed_number.unpack_from(buf, off)[0]))
-            off += valskip
-        else:
+        try:
+            value_decoder = _part_value_decoder[dstype].unpack_from
+        except KeyError:
             raise CollectdUnsupportedDSType("DS type %i unsupported" % dstype)
-
-    return result
+        results.append((dstype, value_decoder(buf, off)[0]))
+        off += 8
+    return results
 
 
 def decode_network_number(ptype, plen, buf):
@@ -129,10 +136,10 @@ def decode_network_number(ptype, plen, buf):
 
 
 def decode_network_string(msgtype, plen, buf):
-    """Decodes a floating point number (64-bit) in collectd network format.
+    """Decodes a string (\0 terminated) in collectd network format.
+    :return: The string as bytes (not unicode).
     """
     return buf[header.size:plen-1]
-
 
 # Mapping of message types to decoding functions.
 _decoders = {
@@ -156,25 +163,44 @@ def decode_network_packet(buf):
     """
     off = 0
     blen = len(buf)
+
     while off < blen:
-        ptype, plen = header.unpack_from(buf, off)
+        try:
+            ptype, plen = header.unpack_from(buf, off)
+        except struct.error as err:
+            raise CollectdDecodeError(err)
+        if not plen:
+            raise CollectdValueError('Invalid part with size=0: buflen=%s off=%s ptype=%s' % (
+                                      blen, off, ptype))
 
         rest = blen - off
         if plen > rest:
-            raise CollectdBufferOverflow("Packet longer than amount of data in buffer: %s vs %s" % (plen, rest))
+            raise CollectdBufferOverflow("Encoded part size greater than left amount of data in buffer: buflen=%s off=%s vsize=%s" % (
+                blen, off, plen))
 
-        if ptype not in _decoders:
-            raise CollectdUnsupportedMessageType("Message type %i not recognized" % ptype)
+        try:
+            decoder = _decoders[ptype]
+        except KeyError:
+            raise CollectdUnsupportedMessageType("Part type %s not recognized (off=%s)" % (ptype, off))
 
-        yield ptype, _decoders[ptype](ptype, plen, buf[off:])
+        try:
+            res = decoder(ptype, plen, buf[off:])
+        except struct.error as err:
+            raise CollectdDecodeError(err)
+
+        yield ptype, res
         off += plen
 
 #############################################################################s
 
 def cdtime_to_time(cdt):
+    '''
+    :param cdt: A CollectD Time or Interval HighResolution encoded value
+    :return: A float, representing a time EPOCH value, with up to nanosec after comma.
+    '''
     # fairly copied from http://git.verplant.org/?p=collectd.git;a=blob;f=src/daemon/utils_time.h
     sec = cdt >> 30
-    nsec = ((cdt & 0b111111111111111111111111111111) /  1.073741824) / 10**9
+    nsec = ((cdt & 0b111111111111111111111111111111) / 1.073741824) / 10**9
     assert 0 <= nsec < 1
     return sec + nsec
 
@@ -198,22 +224,15 @@ class Data(object):
 
     @property
     def source(self):
-        buf = StringIO()
+        res = []
         if self.host:
-            buf.write(self.host)
-        if self.plugin:
-            buf.write("/")
-            buf.write(self.plugin)
-        if self.plugininstance:
-            buf.write("/")
-            buf.write(self.plugininstance)
-        if self.type:
-            buf.write("/")
-            buf.write(self.type)
-        if self.typeinstance:
-            buf.write("/")
-            buf.write(self.typeinstance)
-        return buf.getvalue()
+            res.append(self.host)
+        for attr in ('plugin', 'plugininstance', 'type', 'typeinstance'):
+            val = getattr(self, attr)
+            if val:
+                res.append("/")
+                res.append(val)
+        return ''.join(res)
 
     def __str__(self):
         return "[%s] %s" % (self.time, self.source)
@@ -259,21 +278,112 @@ class Values(Data, list):
 
 #############################################################################s
 
-class Reader(object):
+class Parser(object):
+    ''' Represent a collectd parser.
+
+    Feed its `interpret´ method with some input and get Values or Notification instances.
+    '''
+    Values = Values # so to be able to customize their behavior
+    Notification = Notification
+
+
+    def receive(self):
+        ''' Method used by the parser to get some data if you don't feed it explicitly with.
+        If you want to make use of it you have to subclass and define it respecting the return format.
+        :return: a 2-tuple : (buffer_read, address_read_from)
+        The address_read_from format isn't enforced.
+        '''
+        raise NotImplementedError
+
+    def decode(self, buf=None):
+        """Decodes a given buffer or the next received packet from `receive()´.
+        :return: a generator yielding 2-tuples (type, value).
+        """
+        if buf is None:
+            buf, addr_from = self.receive()
+        return decode_network_packet(buf)
+
+
+    def interpret_opcodes(self, iterable):
+        '''
+        :param iterable: An iterable of 2-tuples (type, value).
+        :return: A generator yielding Values or Notification instances based on the iterable.
+        :raise: a CollectdException instance if there is a decode error.
+        '''
+
+        vl = self.Values() # ; assert isinstance(vl, Values)
+        nt = self.Notification() # ; assert isinstance(nt, Notification)
+
+        for kind, data in iterable:
+
+            if kind == TYPE_TIME:
+                vl.time = nt.time = data
+            elif kind == TYPE_TIMEHR:
+                vl.time = nt.time = cdtime_to_time(data)
+            elif kind == TYPE_INTERVAL:
+                vl.interval = data
+            elif kind == TYPE_INTERVALHR:
+                vl.interval = cdtime_to_time(data)
+            elif kind == TYPE_HOST:
+                vl.host = nt.host = data
+            elif kind == TYPE_PLUGIN:
+                vl.plugin = nt.plugin = data
+            elif kind == TYPE_PLUGIN_INSTANCE:
+                vl.plugininstance = nt.plugininstance = data
+            elif kind == TYPE_TYPE:
+                vl.type = nt.type = data
+            elif kind == TYPE_TYPE_INSTANCE:
+                vl.typeinstance = nt.typeinstance = data
+            elif kind == TYPE_SEVERITY:
+                nt.severity = data
+            elif kind == TYPE_MESSAGE:
+                nt.message = data
+                yield deepcopy(nt)
+            elif kind == TYPE_VALUES:
+                vl[:] = data
+                yield deepcopy(vl)
+
+
+    def interpret(self, input=None):
+        """Interprets an explicit or implicit `input´ "sequence" if given.
+
+        :param input:
+            If None or not given -> A fresh packet will be read from the socket. Then the packet will be decode().
+            If a basestring -> It will also be decode().
+
+            After what the result of decode() (a generator which yields 2-tuple(value_type, value)) is given
+            to interpret_opcodes() which will then yield collectd `Values´ or `Notification´ instances.
+
+            If the `input´ initial value isn't None nor a basestring then it's directly given to
+            interpret_opcodes(), you have to make sure the `input´ has the correct format.
+
+        :return: A generator yielding collectd `Values´ or `Notification´ instances.
+
+        :raise:
+            When a read on the socket is needed, it's not impossible to raise some IO exception.
+            Otherwise no raise should occur to return the generator.
+            But the returned generator can raise (subclass-)`CollectdException´ instance if a decode problem occurs.
+        """
+        if isinstance(input, (type(None), basestring)):
+            input = self.decode(input)
+        return self.interpret_opcodes(input)
+
+
+
+class Reader(Parser):
     """Network reader for collectd data.
 
     Listens on the network in a given address, which can be a multicast
     group address, and handles reading data when it arrives.
     """
-    addr = None
-    host = None
-    port = DEFAULT_PORT
-
-    Values = Values # so to be able to customize their behavior
-    Notification = Notification
 
     def __init__(self, host=None, port=DEFAULT_PORT, multicast=False):
-
+        '''
+        :param host: An host IP address. If not given or None -> multicast is forced enabled.
+        :param port: The port to listen. Defaults to collectd default port.
+        :param multicast: By default False. If truth value -> multicast is enabled.
+        :return: A ready to be used collectd Reader instance. You can
+        '''
         if host is None:
             multicast = True
             host = DEFAULT_IPv4_GROUP
@@ -313,73 +423,13 @@ class Reader(object):
                     socket.IPPROTO_IPV6 if self.ipv6 else socket.IPPROTO_IP,
                     socket.IP_MULTICAST_LOOP, 0)
 
+
+    def receive(self):
+        """ Receives a single raw collectd network packet. """
+        return self._sock.recvfrom(_BUFFER_SIZE)
+
+
     def close(self):
         self._sock.close()
 
 
-    def receive(self):
-        """Receives a single raw collect network packet.
-        """
-        return self._sock.recv(_BUFFER_SIZE)
-
-
-    def decode(self, buf=None):
-        """Decodes a given buffer or the next received packet.
-        """
-        if buf is None:
-            buf = self.receive()
-        return decode_network_packet(buf)
-
-
-    def interpret(self, iterable=None):
-        """Interprets a sequence
-        """
-        if iterable is None:
-            iterable = self.decode()
-        if isinstance(iterable, basestring):
-            iterable = self.decode(iterable)
-        return self.interpret_opcodes(iterable)
-
-
-    def interpret_opcodes(self, iterable):
-        vl = self.Values()
-        nt = self.Notification()
-        assert isinstance(vl, Values)
-        assert isinstance(nt, Notification)
-
-        for kind, data in iterable:
-            if kind == TYPE_TIME:
-                vl.time = nt.time = data
-            elif kind == TYPE_TIMEHR:
-                vl.time = nt.time = cdtime_to_time(data)
-            elif kind == TYPE_INTERVAL:
-                vl.interval = data
-            elif kind == TYPE_INTERVALHR:
-                vl.interval = cdtime_to_time(data)
-            elif kind == TYPE_HOST:
-                vl.host = nt.host = data
-            elif kind == TYPE_PLUGIN:
-                vl.plugin = nt.plugin = data
-            elif kind == TYPE_PLUGIN_INSTANCE:
-                vl.plugininstance = nt.plugininstance = data
-            elif kind == TYPE_TYPE:
-                vl.type = nt.type = data
-            elif kind == TYPE_TYPE_INSTANCE:
-                vl.typeinstance = nt.typeinstance = data
-            elif kind == TYPE_SEVERITY:
-                nt.severity = data
-            elif kind == TYPE_MESSAGE:
-                nt.message = data
-                yield deepcopy(nt)
-            elif kind == TYPE_VALUES:
-                vl[:] = data
-                yield deepcopy(vl)
-
-    def read(self, iterable=None):
-        """ Return a list of decoded packets
-        """
-        if iterable is None:
-            iterable = self.decode()
-        if isinstance(iterable, basestring):
-            iterable = self.decode(iterable)
-        return self.interpret_opcodes(iterable)

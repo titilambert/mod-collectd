@@ -9,12 +9,18 @@ from shinken.log import logger
 from .collectd_parser import (
     CollectdException,
     Reader,
-    Values as _Values, Data as _Data, Notification as _Notification
+    Values as _Values, Data as _Data, Notification as _Notification,
+    _BUFFER_SIZE
 )
 
 
 
 class Data(_Data):
+
+    def __init__(self, *a, **kw):
+        self.grouped_collectd_plugins = kw.pop('grouped_collectd_plugins', [])
+        super(Data, self).__init__(*a, **kw)
+
 
     def get_srv_desc(self):
         '''
@@ -42,7 +48,7 @@ class Data(_Data):
 
 
 
-class Notification(_Notification):
+class Notification(Data, _Notification):
 
     _severity_2_retcode = {
         _Notification.OKAY:      0,
@@ -78,17 +84,14 @@ class ShinkenCollectdReader(Reader):
         return Notification(grouped_collectd_plugins=self.grouped_collectd_plugins)
 
 
-    def receive(self):
+    def xreceive(self):
         """Receives a single raw collect network packet.
         """
-        buf = super(ShinkenCollectdReader, self).receive()
-        logger.info('Got packet %s bytes' % len(buf))
+        #logger.info('reading packet..')
+        buf, addr = self._sock.recvfrom(_BUFFER_SIZE)
+        self._last_buff = buf
+        #buf = super(ShinkenCollectdReader, self).receive()
+        #logger.info('Got packet %s bytes from %s' % (len(buf), addr))
         return buf
 
 
-    def read(self, iterable=None):
-        try:
-            return tuple(super(ShinkenCollectdReader, self).read(iterable))
-        except CollectdException as err:
-            logger.warn('Got Collectd protocol error: %s' % err)
-        return ()
