@@ -27,9 +27,11 @@
 Collectd Plugin for Receiver or arbiter
 """
 
+
 import os
 import re
 import threading
+import dummy_threading
 import time
 import traceback
 from itertools import izip
@@ -37,7 +39,7 @@ from itertools import izip
 #############################################################################
 
 from shinken.basemodule import BaseModule
-from shinken.external_command import ExternalCommand
+from shinken.external_command import ExternalCommand #, ManyExternalCommand
 from shinken.log import logger
 
 #############################################################################
@@ -107,25 +109,32 @@ class Element(object):
         self.interval = interval
         if not last_sent:
             last_sent = time.time()
-        self.last_sent = last_sent + interval
+        self.last_sent = last_sent + 2*interval
 
     def _last_update(self, _op=max):
-        # mvalues[-1] is the metric last read value. [-2] is it's epoch time value.
+        ''' Return the maximal time of last reported perf data.
+        If _op is different then returns that.
+        :param _op: min or max
+        :return:
+        '''
+        # mvalues[-1] is the time when *WE* received that value.
+        # [-2] is the value own epoch time, i.e. the time when the value was read by collectd itself.
         return _op(mvalues[-1][-1] for mvalues in self.perf_datas.values())
 
     @property
     def last_full_update(self):
-        '''
-        :return: The last "full" update time of this element. i.e. the metric mininum last update own time.
-        '''
+        ''' :return: The last "full" update time of this element. i.e. the metric mininum last update own time. '''
         return self._last_update(min)
 
     @property
     def send_ready(self):
+        '''
+        :return: True if this element is ready to have its perfdata sent. False otherwise.
+        '''
         return ( self.perf_datas
-                 and self.last_full_update > self.last_sent
-                 and time.time() > self.last_sent + self.interval - 1)
-
+        #         and self.last_full_update > self.last_sent   # -> send_ready if ALL perfdata were updated (> last_sent).
+                 and self._last_update() > self.last_sent      # -> send_ready if AT LEAST ONE perfdata was updated
+                 and time.time() > self.last_sent + self.interval)
 
     def __str__(self):
         return '%s.%s' % (self.host_name, self.sdesc)
@@ -187,22 +196,21 @@ class Element(object):
                 if max_time is None or w[-2] > max_time:
                     max_time = w[-2]
 
-        logger.info('%s;%s > %s pdatas' % (self.host_name, self.sdesc, len(pdatas)))
+        # logger.debug('%s;%s > %s pdatas' % (self.host_name, self.sdesc, len(pdatas)))
+        #
+        #d = dict((
+        #    ('disk', 16),
+        #    ('interface', 12),
+        #    ('df', 12),
+        #    ('cpu', 32),
+        #    ('load', 1),
+        #    ('processes', 7),
+        #))
+        #check = d.get(self.sdesc, None)
+        #if check and len(pdatas) != check:
+        #    logger.info('DAMN: %s.%s %s vs %s (%s)' % (self.host_name, self.sdesc, check, len(pdatas), res))
 
-        d = dict((
-            ('disk', 16),
-            ('interface', 12),
-            ('df', 12),
-            ('cpu', 32),
-            ('load', 1),
-            ('processes', 7),
-        ))
-        check = d.get(self.sdesc, None)
-        if check and len(pdatas) != check:
-            logger.info('DAMN: %s.%s %s vs %s (%s)' % (self.host_name, self.sdesc, check, len(pdatas), res))
-
-        now = time.time()
-        self.last_sent = now
+        self.last_sent = time.time()
 
         return '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD|%s' % (
                 int(max_time), self.host_name, self.sdesc, res)
@@ -212,7 +220,7 @@ class Element(object):
 class Collectd_arbiter(BaseModule):
     """ Main class for this collecitd module """
 
-    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=None):
+    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=None, use_decicated_reader_thread=False):
         BaseModule.__init__(self, modconf)
         self.host = host
         self.port = port
@@ -221,16 +229,23 @@ class Collectd_arbiter(BaseModule):
             grouped_collectd_plugins = []
         self.elements = {}
         self.grouped_collectd_plugins = grouped_collectd_plugins
-        self.lock = threading.Lock()
-        #self.cond = threading.Condition()
-        #self.send_ready = False
+
+        self.use_decicated_thread = use_decicated_reader_thread
+        th_mgr = ( threading if use_decicated_reader_thread
+                   else dummy_threading )
+        self.lock = th_mgr.Lock()
+        self.cond = th_mgr.Condition()
+        self.send_ready = False
 
 
     def _read_collectd_packet(self, reader):
+        ''' Read and interpret a packet from collectd.
+        :param reader: A collectd Reader instance.
+        '''
         elements = self.elements
         lock = self.lock
 
-        #send_ready = False
+        send_ready = False
         item_iterator = reader.interpret()
         while True:
             try:
@@ -279,11 +294,10 @@ class Collectd_arbiter(BaseModule):
                     if elem.send_ready:
                         send_ready = True
         #end for
-
-        #if send_ready:
-        #    with self.cond:
-        #        self.send_ready = True
-        #        self.cond.notify()
+        if send_ready:
+            with self.cond:
+                self.send_ready = True
+                self.cond.notify()
 
 
     def _read_collectd(self, reader):
@@ -296,21 +310,31 @@ class Collectd_arbiter(BaseModule):
 
         elements = self.elements
         lock = self.lock
-        next_clean = time.time() + 15
+        now = time.time()
+        clean_every = 15
+        report_every = 60
+        next_clean = now + clean_every
+        next_report = now + report_every
+        n_cmd_sent = 0
 
         reader = ShinkenCollectdReader(self.host, self.port, self.multicast,
                                        grouped_collectd_plugins=self.grouped_collectd_plugins)
         try:
-            collectd_reader_thread = threading.Thread(target=self._read_collectd, args=(reader,))
-            collectd_reader_thread.start()
+            if self.use_decicated_thread:
+                collectd_reader_thread = threading.Thread(target=self._read_collectd, args=(reader,))
+                collectd_reader_thread.start()
 
             while not self.interrupted:
 
-                #with self.cond:
-                #    if not self.send_ready:
-                #        self.cond.wait(1)
-                #    self.send_ready = False
-                time.sleep(1)
+                if self.use_decicated_thread:
+                    with self.cond:
+                        if not self.send_ready:
+                            self.cond.wait(1)
+                        self.send_ready = False
+                    # or, simply poll every sec ? :
+                    # time.sleep(1)
+                else:
+                    self._read_collectd_packet(reader)
 
                 todel = []
                 tosend = []
@@ -323,19 +347,20 @@ class Collectd_arbiter(BaseModule):
                             tosend.append(cmd)
 
                 # we could send those in one shot !
+                n_cmd_sent += len(tosend)
                 for cmd in tosend:
                     self.from_q.put(ExternalCommand(cmd))
 
                 now = time.time()
                 if now > next_clean:
-                    next_clean = now + 15
-                    if not collectd_reader_thread.isAlive():
-                        raise Exception('Collectd read thread unexpectedly died.. exiting.')
+                    next_clean = now + clean_every
+                    #if not collectd_reader_thread.isAlive():
+                    #    raise Exception('Collectd read thread unexpectedly died.. exiting.')
                     with lock:
                         for name, elem in elements.iteritems():
                             for pname, vvalues in elem.perf_datas.items():
-                                if vvalues[0][-1] < now - 4*elem.interval:
-                                    # this perf data has not been updated for more than 2 intervals
+                                if vvalues[0][-1] < now - 3*elem.interval:
+                                    # this perf data has not been updated for more than 2 intervals,
                                     # purge it.
                                     del elem.perf_datas[pname]
                                     logger.info('%s : purged %s' % (elem, pname))
@@ -345,9 +370,14 @@ class Collectd_arbiter(BaseModule):
                         for name in todel:
                             logger.info('%s : not anymore updated > purged.' % name)
                             del elements[name]
+                if now > next_report:
+                    next_report = now + report_every
+                    logger.info('%s commands reported during last %s seconds.' % (n_cmd_sent, report_every))
+                    n_cmd_sent = 0
 
         except Exception as err:
             logger.error("[Collectd] Unexpected error: %s ; %s" % (err, traceback.format_exc()))
         finally:
             reader.close()
-            collectd_reader_thread.join()
+            if self.use_decicated_thread:
+                collectd_reader_thread.join()
