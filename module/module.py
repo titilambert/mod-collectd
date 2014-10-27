@@ -179,10 +179,11 @@ class Element(object):
         for k in sorted(pdatas):
             v = pdatas[k]
             for i, w in enumerate(v):
+                value_to_str = lambda v: '%f' % v if isinstance(w[2], float) else str
                 if len(v) > 1:
-                    pdata += '%s_%d=%s ' % (k, i, str(w[2]))
+                    res += '%s_%d=%s ' % (k, i, value_to_str(w[2]))
                 else:
-                    pdata += '%s=%s ' % (k, str(w[2]))
+                    res += '%s=%s ' % (k, value_to_str(w[2]))
                 if max_time is None or w[-2] > max_time:
                     max_time = w[-2]
 
