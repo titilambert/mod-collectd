@@ -83,15 +83,3 @@ class ShinkenCollectdReader(Reader):
     def Notification(self):
         return Notification(grouped_collectd_plugins=self.grouped_collectd_plugins)
 
-
-    def xreceive(self):
-        """Receives a single raw collect network packet.
-        """
-        #logger.info('reading packet..')
-        buf, addr = self._sock.recvfrom(_BUFFER_SIZE)
-        self._last_buff = buf
-        #buf = super(ShinkenCollectdReader, self).receive()
-        #logger.info('Got packet %s bytes from %s' % (len(buf), addr))
-        return buf
-
-
