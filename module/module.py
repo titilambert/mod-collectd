@@ -1,5 +1,4 @@
 #!/usr/bin/python
-
 # -*- coding: utf-8 -*-
 
 # Copyright (C) 2009-2012:
@@ -28,13 +27,34 @@
 Collectd Plugin for Receiver or arbiter
 """
 
+
 import os
+import re
+import threading
+import dummy_threading
 import time
+import traceback
 from itertools import izip
 
+#############################################################################
+
 from shinken.basemodule import BaseModule
-from shinken.external_command import ExternalCommand
+from shinken.external_command import ExternalCommand #, ManyExternalCommand
 from shinken.log import logger
+
+#############################################################################
+
+from .collectd_parser import (
+    CollectdException,
+    DS_TYPE_COUNTER, DS_TYPE_GAUGE, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE,
+    DEFAULT_PORT, DEFAULT_IPv4_GROUP
+)
+from .collectd_shinken_parser import (
+    Data, Values, Notification,
+    ShinkenCollectdReader
+)
+
+#############################################################################
 
 properties = {
     'daemons': ['arbiter', 'receiver'],
@@ -42,10 +62,8 @@ properties = {
     'external': True,
     }
 
-DEFAULT_PORT = 25826
-DEFAULT_MULTICAST_IP = "239.192.74.66"
-BUFFER_SIZE = 4096
 
+#############################################################################
 
 def get_instance(plugin):
     """ This function is called by the module manager
@@ -59,7 +77,7 @@ def get_instance(plugin):
     if hasattr(plugin, 'host'):
         host = plugin.host
     else:
-        host = DEFAULT_MULTICAST_IP
+        host = DEFAULT_IPv4_GROUP
         multicast = True
 
     if hasattr(plugin, 'port'):
@@ -78,403 +96,288 @@ def get_instance(plugin):
     instance = Collectd_arbiter(plugin, host, port, multicast, grouped_collectd_plugins)
     return instance
 
-import socket
-import struct
-import time
-from StringIO import StringIO
-
-
-# Collectd message types
-TYPE_HOST = 0x0000
-TYPE_TIME = 0x0001
-TYPE_TIME_HR = 0x0008
-TYPE_PLUGIN = 0x0002
-TYPE_PLUGIN_INSTANCE = 0x0003
-TYPE_TYPE = 0x0004
-TYPE_TYPE_INSTANCE = 0x0005
-TYPE_VALUES = 0x0006
-TYPE_INTERVAL = 0x0007
-TYPE_INTERVAL_HR = 0x0009
-TYPE_MESSAGE = 0x0100
-TYPE_SEVERITY = 0x0101
-
-# DS kinds
-DS_TYPE_COUNTER = 0
-DS_TYPE_GAUGE = 1
-DS_TYPE_DERIVE = 2
-DS_TYPE_ABSOLUTE = 3
-
-header = struct.Struct("!2H")
-number = struct.Struct("!Q")
-short = struct.Struct("!H")
-double = struct.Struct("<d")
-
-elements = {}
-
-
-def decode_values(pktype, plen, buf):
-    """ Decode values from collectd requests """
-    nvalues = short.unpack_from(buf, header.size)[0]
-    off = header.size + short.size + nvalues
-    valskip = double.size
-
-    # check the packet head
-    if ((valskip + 1) * nvalues + short.size + header.size) != plen:
-        return []
-    if double.size != number.size:
-        return []
-
-    result = []
-    for dstype in map(ord, buf[header.size + short.size:off]):
-        if (dstype == DS_TYPE_COUNTER or dstype == DS_TYPE_DERIVE or dstype == DS_TYPE_ABSOLUTE):
-            v = (dstype, number.unpack_from(buf, off)[0])
-            result.append(v)
-            off += valskip
-        elif dstype == DS_TYPE_GAUGE:
-            v = (dstype, double.unpack_from(buf, off)[0])
-            result.append(v)
-            off += valskip
-        else:
-            logger.warning("[Collectd] DS type %i unsupported" % dstype)
-
-    return result
-
-
-# Get a u64
-def decode_number(pktype, pklen, buf):
-    """ Decode number typed value """
-    return number.unpack_from(buf, header.size)[0]
-
-
-# Get a simple char
-def decode_string(msgtype, pklen, buf):
-    """ Decode string typed value """
-    return buf[header.size:pklen-1]
-
-# Mapping of message types to decoding functions.
-decoder_mapping = {
-    TYPE_VALUES: decode_values,
-    TYPE_TIME: decode_number,
-    TYPE_TIME_HR: decode_number,
-    TYPE_INTERVAL: decode_number,
-    TYPE_INTERVAL_HR: decode_number,
-    TYPE_HOST: decode_string,
-    TYPE_PLUGIN: decode_string,
-    TYPE_PLUGIN_INSTANCE: decode_string,
-    TYPE_TYPE: decode_string,
-    TYPE_TYPE_INSTANCE: decode_string,
-    TYPE_MESSAGE: decode_string,
-    TYPE_SEVERITY: decode_number,
-}
-
-
-def decode_packet(buf):
-    """ decode packet from collectd requests """
-    off = 0
-    buflen = len(buf)
-    while off < buflen:
-        pktype, pklen = header.unpack_from(buf, off)
-
-        if pklen > buflen - off:
-            raise ValueError("Packet too long?")
-
-        if pktype not in decoder_mapping:
-            raise ValueError("Message type %i not recognized" % pktype)
-
-        v = decoder_mapping[pktype](pktype, pklen, buf[off:])
-        yield pktype, v
-        off += pklen
-
-
-class Data(list, object):
-    """ This class will transform datas
-
-    :grouped_collectd_plugins: list of collecd plugins to group
-    """
-    def __init__(self, grouped_collectd_plugins=[],  **kw):
-
-        self.kind = 0
-        self.time = 0
-        self.interval = 0
-        self.host = None
-        self.plugin = ''
-        self.plugininstance = ''
-        self.type = ''
-        self.typeinstance = ''
-        self.message = ''
-        self.severity = 0
-        self.values = []
-        self.grouped_collectd_plugins = grouped_collectd_plugins
-
-    def __str__(self):
-        """ Return a readable format of a Data object """
-        return "[%i] %s" % (self.time, self.values)
-
-    def get_srv_desc(self):
-        """ Determine service name from collectd datas """
-        r = self.plugin
-        if not r in self.grouped_collectd_plugins:
-            if self.plugininstance:
-                r += '-' + self.plugininstance
-        return r
-
-    def get_message(self):
-        """ Get message of a Data object
-        """
-        return self.message
-
-    def get_kind(self):
-        """ Get kind of a Data object
-        """
-        return self.kind
-
-    def get_metric_name(self):
-        """ Determine perf data name from collectd datas
-        """
-        r = self.type
-        if self.plugin in self.grouped_collectd_plugins:
-            if self.plugininstance:
-                r += '-' + self.plugininstance
-        if self.typeinstance:
-            r += '-' + self.typeinstance
-        return r
-
-    def get_metric_values(self):
-        """ Determine perf datas from collectd datas
-        """
-        if len(self.values) == 0:
-            return None
-        return self.values
-
-    def get_name(self):
-        """ Determine data name from collectd datas
-        """
-        if not self.host:
-            return None
-        srv_desc = self.get_srv_desc()
-        r = '%s;%s' % (self.host, srv_desc)
-        return r
-
-    def get_time(self):
-        """ Return data time from collectd datas
-        """
-        return self.time
-
-    def get_message_command(self):
-        """ Return data severity (exit code) from collectd datas
-        """
-        now = int(time.time())
-        if self.severity == 4:  # OK
-            returncode = 0
-        elif self.severity == 1:
-            returncode = 2
-        elif self.severity == 2:
-            returncode = 1
-        else:
-            returncode = 3
-        return '[%d] PROCESS_SERVICE_CHECK_RESULT;%s;%s;%d;%s' % (now,
-                                                                  self.host,
-                                                                  self.get_srv_desc(),
-                                                                  returncode,
-                                                                  self.message,
-                                                                  )
-
-
-class CollectdServer(object):
-    """ Collectd server
-    This class listen and and handle collectd requests
-
-    :host:                     Bind address
-    :port:                     Bind port
-    :multicast:                Enable multisite
-    :grouped_collectd_plugins: List of collecd plugins to group
-    """
-    def __init__(self, host, port, multicast, grouped_collectd_plugins=[]):
-        self.host = host
-        self.port = port
-        self.grouped_collectd_plugins = grouped_collectd_plugins
-
-        logger.info("[Collectd] Opening socket")
-        family, socktype, proto, _, sockaddr = socket.getaddrinfo(None if multicast else self.host,
-                                                                  self.port,
-                                                                  socket.AF_UNSPEC,
-                                                                  socket.SOCK_DGRAM,
-                                                                  0,
-                                                                  socket.AI_PASSIVE,
-                                                                  )[0]
-
-        self._sock = socket.socket(family, socktype, proto)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._sock.bind(sockaddr)
-        logger.info("[Collectd] Socket open")
-
-        if multicast:
-            if hasattr(socket, "SO_REUSEPORT"):
-                self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-
-            val = struct.pack("4sl", socket.inet_aton(self.host), socket.INADDR_ANY)
-
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, val)
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_LOOP, 0)
-
-        logger.info("[Collectd] Socket is opened")
-
-    def interpret_opcodes(self, iterable):
-        """ Decode some stuff from Collectd
-        """
-        d = Data(self.grouped_collectd_plugins)
-
-        for kind, data in iterable:
-            d.kind = kind
-            if kind == TYPE_TIME:
-                d.time = data
-            elif kind == TYPE_TIME_HR:
-                d.time = data >> 30
-            elif kind == TYPE_INTERVAL:
-                d.interval = data
-            elif kind == TYPE_INTERVAL_HR:
-                d.interval = data >> 30
-            elif kind == TYPE_HOST:
-                d.host = data
-            elif kind == TYPE_PLUGIN:
-                d.plugin = data
-            elif kind == TYPE_PLUGIN_INSTANCE:
-                d.plugininstance = data
-            elif kind == TYPE_TYPE:
-                d.type = data
-            elif kind == TYPE_TYPE_INSTANCE:
-                d.typeinstance = data
-            elif kind == TYPE_SEVERITY:
-                d.severity = data
-            elif kind == TYPE_VALUES:
-                d.values = data
-                yield d
-            elif kind == TYPE_MESSAGE:
-                d.message = data
-                yield d
-
-    def receive(self):
-        """ Read socket
-        """
-        return self._sock.recv(BUFFER_SIZE)
-
-    def decode(self, buf=None):
-        """ Return a decode packet
-        """
-        if buf is None:
-            buf = self.receive()
-        return decode_packet(buf)
-
-    def read(self, iterable=None):
-        """ Return a list of decoded packets
-        """
-        if iterable is None:
-            iterable = self.decode()
-        if isinstance(iterable, basestring):
-            iterable = self.decode(iterable)
-        return self.interpret_opcodes(iterable)
-
+#############################################################################
 
 class Element(object):
     """ Element store service name and all perfdatas before send it in a external command """
-    def __init__(self, host_name, sdesc, interval):
+
+    def __init__(self, host_name, sdesc, interval, last_sent=None):
         self.host_name = host_name
         self.sdesc = sdesc
         self.perf_datas = {}
-        self.last_update = 0.0
+        # for the first time we'll wait 2*interval to be sure to get a complete data set :
         self.interval = interval
-        self.got_new_data = False
+        if not last_sent:
+            last_sent = time.time()
+        self.last_sent = last_sent + 2*interval
+
+    def _last_update(self, _op=max):
+        ''' Return the maximal time of last reported perf data.
+        If _op is different then returns that.
+        :param _op: min or max
+        :return:
+        '''
+        # mvalues[-1] is the time when *WE* received that value.
+        # [-2] is the value own epoch time, i.e. the time when the value was read by collectd itself.
+        return _op(mvalues[-1][-1] for mvalues in self.perf_datas.values())
+
+    @property
+    def last_full_update(self):
+        ''' :return: The last "full" update time of this element. i.e. the metric mininum last update own time. '''
+        return self._last_update(min)
+
+    @property
+    def send_ready(self):
+        '''
+        :return: True if this element is ready to have its perfdata sent. False otherwise.
+        '''
+        return ( self.perf_datas
+        #         and self.last_full_update > self.last_sent   # -> send_ready if ALL perfdata were updated (> last_sent).
+                 and self._last_update() > self.last_sent      # -> send_ready if AT LEAST ONE perfdata was updated
+                 and time.time() > self.last_sent + self.interval)
+
+    def __str__(self):
+        return '%s.%s' % (self.host_name, self.sdesc)
 
     def add_perf_data(self, mname, mvalues, mtime):
-        """ Add perf datas to the message to send to Shinken """
+        """ Add perf datas to this element.
+        :param mname:   The metric name.
+        :param mvalues: The metric read values.
+        :param mtime:   The "epoch" time when the values were read.
+        """
         if not mvalues:
             return
 
-        r = []
+        res = []
+        now = time.time()
+
         if mname not in self.perf_datas:
+            logger.info('%s : New perfdata: %s : %s' % (self, mname, mvalues))
             for (dstype, newrawval) in mvalues:
-                r.append((dstype, newrawval, newrawval, mtime))
+                # we also retain the local time (`now´) more for convenience purpose.
+                res.append((dstype, newrawval, newrawval, mtime, now))
         else:
             oldvalues = self.perf_datas[mname]
-
-            for (olddstype, oldrawval, oldval, oldtime), (dstype, newrawval) in izip(oldvalues, mvalues):
+            for (olddstype, oldrawval, oldval, oldtime, oldnow), (dstype, newrawval) in izip(oldvalues, mvalues):
                 difftime = mtime - oldtime
                 if difftime < 1:
                     continue
-                if dstype == DS_TYPE_COUNTER or dstype == DS_TYPE_DERIVE or dstype == DS_TYPE_ABSOLUTE:
-                    r.append((dstype, newrawval, (newrawval - oldrawval) / float(difftime), mtime))
+                if dstype in (DS_TYPE_COUNTER, DS_TYPE_DERIVE, DS_TYPE_ABSOLUTE):
+                    res.append((dstype, newrawval, (newrawval - oldrawval) / float(difftime), mtime, now))
                 elif dstype == DS_TYPE_GAUGE:
-                    r.append((dstype, newrawval, newrawval, mtime))
+                    res.append((dstype, newrawval, newrawval, mtime, now))
 
-        self.perf_datas[mname] = r
-        self.got_new_data = True
+        if res:
+           self.perf_datas[mname] = res
+
 
     def get_command(self):
-        """ Prepare the external command for Shinken """
-        if len(self.perf_datas) == 0:
-            return None
+        """ Look if this element has data to be sent to Shinken.
+        :return
+            - None if element has not all its perf data refreshed since last sent..
+            - The command to be sent otherwise. """
 
-        if not self.got_new_data:
-            return None
+        if not self.send_ready:
+            return
 
-        now = int(time.time())
-        if now > self.last_update + self.interval:
-            r = '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD| ' % (now, self.host_name, self.sdesc)
-            for (k, v) in self.perf_datas.iteritems():
-                for i, w in enumerate(v):
-                    if len(v) > 1:
-                        r += '%s_%d=%s ' % (k, i, str(w[2]))
-                    else:
-                        r += '%s=%s ' % (k, str(w[2]))
-            logger.debug('Updating: %s - %s ' % (self.host_name, self.sdesc))
-#            self.perf_datas.clear()
-            self.last_update = now
-            self.got_new_data = False
-            return r
+        res = ''
+        pdatas = self.perf_datas
 
+        max_time = None
+
+        for k in sorted(pdatas):
+            v = pdatas[k]
+            for i, w in enumerate(v):
+                value_to_str = lambda v: '%f' % v if isinstance(w[2], float) else str
+                if len(v) > 1:
+                    res += '%s_%d=%s ' % (k, i, value_to_str(w[2]))
+                else:
+                    res += '%s=%s ' % (k, value_to_str(w[2]))
+                if max_time is None or w[-2] > max_time:
+                    max_time = w[-2]
+
+        # logger.debug('%s;%s > %s pdatas' % (self.host_name, self.sdesc, len(pdatas)))
+        #
+        #d = dict((
+        #    ('disk', 16),
+        #    ('interface', 12),
+        #    ('df', 12),
+        #    ('cpu', 32),
+        #    ('load', 1),
+        #    ('processes', 7),
+        #))
+        #check = d.get(self.sdesc, None)
+        #if check and len(pdatas) != check:
+        #    logger.info('DAMN: %s.%s %s vs %s (%s)' % (self.host_name, self.sdesc, check, len(pdatas), res))
+
+        self.last_sent = time.time()
+
+        return '[%d] PROCESS_SERVICE_OUTPUT;%s;%s;CollectD|%s' % (
+                int(max_time), self.host_name, self.sdesc, res)
+
+#############################################################################
 
 class Collectd_arbiter(BaseModule):
     """ Main class for this collecitd module """
-    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=[]):
+
+    def __init__(self, modconf, host, port, multicast, grouped_collectd_plugins=None, use_decicated_reader_thread=False):
         BaseModule.__init__(self, modconf)
         self.host = host
         self.port = port
         self.multicast = multicast
+        if grouped_collectd_plugins is None:
+            grouped_collectd_plugins = []
+        self.elements = {}
         self.grouped_collectd_plugins = grouped_collectd_plugins
 
-    # When you are in "external" mode, that is the main loop of your process
-    def main(self):
-        """ Plugin main loop """
-        self.set_proctitle(self.name)
-        self.set_exit_handler()
+        self.use_decicated_thread = use_decicated_reader_thread
+        th_mgr = ( threading if use_decicated_reader_thread
+                   else dummy_threading )
+        self.lock = th_mgr.Lock()
+        self.cond = th_mgr.Condition()
+        self.send_ready = False
 
+
+    def _read_collectd_packet(self, reader):
+        ''' Read and interpret a packet from collectd.
+        :param reader: A collectd Reader instance.
+        '''
+        elements = self.elements
+        lock = self.lock
+
+        send_ready = False
+        item_iterator = reader.interpret()
+        while True:
+            try:
+                item = next(item_iterator)
+            except StopIteration:
+                break
+            except CollectdException as err:
+                logger.error('CollectdException: %s' % err)
+                continue
+
+            assert isinstance(item, Data)
+            #logger.info("[Collectd] < %s" % item)
+
+            if isinstance(item, Notification):
+                cmd = item.get_message_command()
+                if cmd is not None:
+                    #logger.info('-> %s', cmd)
+                    self.from_q.put(ExternalCommand(cmd))
+
+            elif isinstance(item, Values):
+                name = item.get_name()
+                elem = elements.get(name, None)
+                is_new = not bool(elem)
+                if elem is None:
+                    elem = Element(item.host,
+                                   item.get_srv_desc(),
+                                   item.interval)
+                    logger.info('Created %s ; interval=%s' % (elem, elem.interval))
+                else:
+                    assert isinstance(elem, Element)
+                    if elem.interval != item.interval:
+                        logger.info('%s : interval changed from %s to %s ; adapting..' % (
+                                    name, elem.interval, item.interval))
+                        with lock:
+                            # make sure interval is updated when it's changed by collectd client:
+                            elem.interval = item.interval
+                            # also reset last_update time so that we'll wait that before resending its data:
+                            elem.last_sent = time.time() + item.interval
+                            elem.perf_datas.clear()
+
+                # now we can add this perf data:
+                with lock:
+                    elem.add_perf_data(item.get_metric_name(), item, item.time)
+                    if is_new:
+                        elements[name] = elem
+                    if elem.send_ready:
+                        send_ready = True
+        #end for
+        if send_ready:
+            with self.cond:
+                self.send_ready = True
+                self.cond.notify()
+
+
+    def _read_collectd(self, reader):
+        while not self.interrupted:
+            self._read_collectd_packet(reader)
+
+
+    # When you are in "external" mode, that is the main loop of your process
+    def do_loop_turn(self):
+
+        elements = self.elements
+        lock = self.lock
+        now = time.time()
+        clean_every = 15
+        report_every = 60
+        next_clean = now + clean_every
+        next_report = now + report_every
+        n_cmd_sent = 0
+
+        reader = ShinkenCollectdReader(self.host, self.port, self.multicast,
+                                       grouped_collectd_plugins=self.grouped_collectd_plugins)
         try:
-            cs = CollectdServer(self.host, self.port, self.multicast, self.grouped_collectd_plugins)
-            while True:
-                # Each second we are looking at sending old elements
-                for e in elements.values():
-                    c = e.get_command()
-                    if c is not None:
-                        logger.debug("[Collectd] Got %s" % c)
-                        self.from_q.put(ExternalCommand(c))
-                for item in cs.read():
-                    logger.debug("[Collectd] %s: %s" % (item, item.__dict__))
-                    n = item.get_name()
-                    if n and n not in elements:
-                        e = Element(item.host,
-                                    item.get_srv_desc(),
-                                    item.interval)
-                        elements[n] = e
-                    e = elements[n]
-                    if item.get_kind() == TYPE_VALUES:
-                        e.add_perf_data(item.get_metric_name(),
-                                        item.get_metric_values(),
-                                        item.get_time())
-                    elif item.get_kind() == TYPE_MESSAGE:
-                        c = item.get_message_command()
-                        if c is not None:
-                            self.from_q.put(ExternalCommand(c))
-        except Exception, e:
-            logger.error("[Collectd] exception: %s" % str(e))
-        except ValueError, exp:
-            logger.error("[Collectd] Read error: %s" % exp)
+            if self.use_decicated_thread:
+                collectd_reader_thread = threading.Thread(target=self._read_collectd, args=(reader,))
+                collectd_reader_thread.start()
+
+            while not self.interrupted:
+
+                if self.use_decicated_thread:
+                    with self.cond:
+                        if not self.send_ready:
+                            self.cond.wait(1)
+                        self.send_ready = False
+                    # or, simply poll every sec ? :
+                    # time.sleep(1)
+                else:
+                    self._read_collectd_packet(reader)
+
+                todel = []
+                tosend = []
+
+                with lock:
+                    for name, elem in elements.iteritems():
+                        assert isinstance(elem, Element)
+                        cmd = elem.get_command()
+                        if cmd:
+                            tosend.append(cmd)
+
+                # we could send those in one shot !
+                n_cmd_sent += len(tosend)
+                for cmd in tosend:
+                    self.from_q.put(ExternalCommand(cmd))
+
+                now = time.time()
+                if now > next_clean:
+                    next_clean = now + clean_every
+                    #if not collectd_reader_thread.isAlive():
+                    #    raise Exception('Collectd read thread unexpectedly died.. exiting.')
+                    with lock:
+                        for name, elem in elements.iteritems():
+                            for pname, vvalues in elem.perf_datas.items():
+                                if vvalues[0][-1] < now - 3*elem.interval:
+                                    # this perf data has not been updated for more than 2 intervals,
+                                    # purge it.
+                                    del elem.perf_datas[pname]
+                                    logger.info('%s : purged %s' % (elem, pname))
+                            if not elem.perf_datas:
+                                todel.append(name)
+
+                        for name in todel:
+                            logger.info('%s : not anymore updated > purged.' % name)
+                            del elements[name]
+                if now > next_report:
+                    next_report = now + report_every
+                    logger.info('%s commands reported during last %s seconds.' % (n_cmd_sent, report_every))
+                    n_cmd_sent = 0
+
+        except Exception as err:
+            logger.error("[Collectd] Unexpected error: %s ; %s" % (err, traceback.format_exc()))
+        finally:
+            reader.close()
+            if self.use_decicated_thread:
+                collectd_reader_thread.join()
